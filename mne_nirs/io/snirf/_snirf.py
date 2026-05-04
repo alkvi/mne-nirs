@@ -16,7 +16,7 @@ from mne.transforms import _get_trans, apply_trans
 SPEC_FORMAT_VERSION = "1.1"
 
 
-def write_raw_snirf(raw, fname, add_montage=False):
+def write_raw_snirf(raw, fname, add_montage=False, aux_data=None):
     """Write continuous wave data to disk in SNIRF format.
 
     Writes the data from a raw object to a SNIRF file using
@@ -66,7 +66,8 @@ def write_raw_snirf(raw, fname, add_montage=False):
         _add_single_data_block(raw, nirs)
         _add_probe_info(raw, nirs, add_montage=add_montage)
         _add_stim_info(raw, nirs)
-
+        if aux_data is not None:
+            _write_aux_groups(aux_data, nirs)
 
 def _str_encode(str_val):
     """Encode a string for use in an h5py Dataset.
@@ -323,6 +324,65 @@ def _add_stim_info(raw, nirs):
             ]
         stim_group.create_dataset("data", data=stims)
         stim_group.create_dataset("name", data=_str_encode(desc))
+
+
+def _write_aux_groups(aux_data, nirs):
+    """Write AUX groups to SNIRF file.
+
+    Parameters
+    ----------
+    aux_data : list of dict
+        List of AUX entries as returned by read_snirf_aux().
+        TODO: replace with container
+    nirs : h5py.Group
+        The /nirs group to write into.
+    """
+
+    # SNIRF-compliant string dtype (variable-length)
+    str_dtype = h5py.string_dtype(encoding="utf-8")
+
+    for i, aux in enumerate(aux_data, start=1):
+        g = nirs.create_group(f"aux{i}")
+
+        g.create_dataset(
+            "name",
+            data=str(aux["name"]),
+            dtype=str_dtype
+        )
+
+        data = np.asarray(aux["dataTimeSeries"])
+
+        # Ensure 2D as required by SNIRF
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+
+        g.create_dataset(
+            "dataTimeSeries",
+            data=data
+        )
+
+        time = np.asarray(aux["time"])
+
+        if time.ndim != 1:
+            raise ValueError("AUX 'time' must be a 1D array")
+
+        g.create_dataset(
+            "time",
+            data=time
+        )
+
+        if "dataUnit" in aux and aux["dataUnit"] is not None:
+            g.create_dataset(
+                "dataUnit",
+                data=str(aux["dataUnit"]),
+                dtype=str_dtype
+            )
+
+        if "timeOffset" in aux and aux["timeOffset"] is not None:
+            g.create_dataset(
+                "timeOffset",
+                data=float(aux["timeOffset"])
+            )
 
 
 def _get_unique_source_list(raw):
