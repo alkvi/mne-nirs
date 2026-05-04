@@ -11,6 +11,8 @@ from mne.channels import make_standard_montage
 from mne.io.pick import _picks_to_idx
 from mne.transforms import _get_trans, apply_trans
 
+from ._aux import SnirfAux
+
 # The currently-implemented spec can be found here:
 # https://raw.githubusercontent.com/fNIRS/snirf/v1.1/snirf_specification.md
 SPEC_FORMAT_VERSION = "1.1"
@@ -331,58 +333,35 @@ def _write_aux_groups(aux_data, nirs):
 
     Parameters
     ----------
-    aux_data : list of dict
-        List of AUX entries as returned by read_snirf_aux().
-        TODO: replace with container
+    aux_data : list of SnirfAux
+        Auxiliary data entries to write.
     nirs : h5py.Group
         The /nirs group to write into.
     """
-
-    # SNIRF-compliant string dtype (variable-length)
     str_dtype = h5py.string_dtype(encoding="utf-8")
 
     for i, aux in enumerate(aux_data, start=1):
         g = nirs.create_group(f"aux{i}")
 
-        g.create_dataset(
-            "name",
-            data=str(aux["name"]),
-            dtype=str_dtype
-        )
+        # Required fields
+        g.create_dataset("name", data=str(aux.name), dtype=str_dtype)
 
-        data = np.asarray(aux["dataTimeSeries"])
-
-        # Ensure 2D as required by SNIRF
+        data = np.asarray(aux.data)
         if data.ndim == 1:
             data = data[:, np.newaxis]
+        g.create_dataset("dataTimeSeries", data=data)
 
-        g.create_dataset(
-            "dataTimeSeries",
-            data=data
-        )
-
-        time = np.asarray(aux["time"])
-
+        time = np.asarray(aux.time)
         if time.ndim != 1:
-            raise ValueError("AUX 'time' must be a 1D array")
+            raise ValueError(f"SnirfAux '{aux.name}': time must be a 1-D array")
+        g.create_dataset("time", data=time)
 
-        g.create_dataset(
-            "time",
-            data=time
-        )
+        # Optional fields
+        if aux.data_unit is not None:
+            g.create_dataset("dataUnit", data=str(aux.data_unit), dtype=str_dtype)
 
-        if "dataUnit" in aux and aux["dataUnit"] is not None:
-            g.create_dataset(
-                "dataUnit",
-                data=str(aux["dataUnit"]),
-                dtype=str_dtype
-            )
-
-        if "timeOffset" in aux and aux["timeOffset"] is not None:
-            g.create_dataset(
-                "timeOffset",
-                data=float(aux["timeOffset"])
-            )
+        if aux.time_offset is not None:
+            g.create_dataset("timeOffset", data=float(aux.time_offset))
 
 
 def _get_unique_source_list(raw):

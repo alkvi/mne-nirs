@@ -12,18 +12,43 @@ from scipy import interpolate
 
 
 class SnirfAux:
-    """Container representing one SNIRF /nirs/aux(i) group."""
+    """Container representing one SNIRF /nirs/aux(i) group.
+
+    Parameters
+    ----------
+    name : str
+        Name of the auxiliary channel.
+    data : ndarray, shape (n_samples, n_channels)
+        The auxiliary time-series data.
+    time : ndarray, shape (n_samples,)
+        Time vector in TimeUnit units (see metaDataTags).
+    data_unit : str or None
+        SI unit of the auxiliary channel (optional).
+    time_offset : float or None
+        Offset of file time origin relative to absolute clock time (optional).
+    """
 
     def __init__(self, name, data, time, data_unit=None, time_offset=None):
         self.name = name
-        self.data = data                # shape (n_samples, n_channels)
-        self.time = time                # shape (n_samples,)
+        self.data = np.asarray(data)
+        self.time = np.asarray(time)
         self.data_unit = data_unit
         self.time_offset = time_offset
 
+    def __repr__(self):
+        n_samples, n_ch = self.data.shape if self.data.ndim == 2 else (len(self.data), 1)
+        return (
+            f"<SnirfAux | name={self.name!r}, "
+            f"n_samples={n_samples}, n_channels={n_ch}, "
+            f"data_unit={self.data_unit!r}>"
+        )
+
 
 def read_snirf_aux(fname):
-    """Read raw auxiliary data from SNIRF file.
+    """Read raw auxiliary data from a SNIRF file.
+
+    Reads all /nirs/aux(i) groups and returns them as a list of
+    :class:`SnirfAux` containers.
 
     Parameters
     ----------
@@ -32,40 +57,32 @@ def read_snirf_aux(fname):
 
     Returns
     -------
-    aux_data : list of dict
-        Each entry corresponds to one /nirs/aux(i) group:
-        dict with keys:
-            - name : str
-            - dataTimeSeries : ndarray (n_samples, n_channels)
-            - time : ndarray (n_samples,)
-            - dataUnit : str (optional)
-            - timeOffset : float (optional)
+    aux_list : list of SnirfAux
+        One entry per /nirs/aux(i) group found in the file.
     """
-
     aux_out = []
 
     with h5py.File(fname, "r") as dat:
-
         basename = _get_nirs_basename(dat)
-        aux_keys, aux_names = _get_aux_entries(dat)
+        aux_keys, _ = _get_aux_entries(dat)
 
         for key in sorted(aux_keys):
-            g = dat[f"{base}/{key}"]
+            g = dat[f"{basename}/{key}"]
 
-            entry = {}
+            name = _decode_string(g["name"])
+            data = np.array(g["dataTimeSeries"])
+            time = np.array(g["time"])
 
-            # Required in SNIRF spec
-            entry["name"] = _decode_name(g["name"])
-            entry["dataTimeSeries"] = np.array(g["dataTimeSeries"])
-            entry["time"] = np.array(g["time"])
+            data_unit = _decode_string(g["dataUnit"]) if "dataUnit" in g else None
+            time_offset = np.array(g["timeOffset"]).item() if "timeOffset" in g else None
 
-            # Optional in SNIRF spec
-            if "dataUnit" in g:
-                entry["dataUnit"] = _decode_name(g["dataUnit"])
-            if "timeOffset" in g:
-                entry["timeOffset"] = np.array(g["timeOffset"]).item()
-
-            aux_out.append(entry)
+            aux_out.append(SnirfAux(
+                name=name,
+                data=data,
+                time=time,
+                data_unit=data_unit,
+                time_offset=time_offset,
+            ))
 
     return aux_out
 
@@ -127,18 +144,18 @@ def _get_aux_entries(dat: h5py.File):
     basename = _get_nirs_basename(dat)
     all_keys = list(dat.get(basename).keys())
     aux_keys = [i for i in all_keys if i.startswith("aux")]
-    aux_names = [_decode_name(dat.get(f"{basename}/{k}/name")) for k in aux_keys]
+    aux_names = [_decode_string(dat.get(f"{basename}/{k}/name")) for k in aux_keys]
     logging.debug(f"Found auxiliary channels {aux_names}")
     return aux_keys, aux_names
 
 
-def _decode_name(key):
-
+def _decode_string(ds):
+    """Decode an h5py string dataset to a Python str."""
     if ds is None:
         return None
 
-    # Prefer h5py’s string-safe accessor for h5py ≥ 3
-    # otherwise fall back to legacy version/files
+    # Prefer h5py's string-safe accessor (h5py >= 3),
+    # otherwise fall back for legacy files.
     try:
         return ds.asstr()[()]
     except Exception:
