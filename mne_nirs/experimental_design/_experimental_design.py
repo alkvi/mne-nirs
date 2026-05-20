@@ -4,6 +4,9 @@
 
 import mne
 import numpy as np
+from scipy.linalg import eigh
+from scipy.stats import zscore as _zscore
+from sklearn.decomposition import PCA
 
 
 def make_first_level_design_matrix(
@@ -195,3 +198,204 @@ def drift_high_pass(raw):
     longest, annotation_name = longest_inter_annotation_interval(raw)
     max_isi = np.max(longest)
     return 1 / (2 * max_isi)
+
+
+def _temporal_embedding(aux, tau, n_emb):
+    """
+    Build a temporally embedded auxiliary matrix.
+
+    Parameters
+    ----------
+    aux : array of shape (n_times, n_channels)
+        Auxiliary signal matrix.
+    tau : int
+        Lag in samples between consecutive embeddings.
+    n_emb : int
+        Number of additional time-shifted copies to append.
+
+    Returns
+    -------
+    emb : array of shape (n_times, n_channels * (n_emb + 1))
+        Temporally embedded signal.
+    """
+    copies = [aux]
+    for i in range(1, n_emb + 1):
+        shifted = np.roll(aux, shift=i * tau, axis=0)
+        shifted[: 2 * i] = shifted[2 * i]
+        copies.append(shifted)
+    return np.concatenate(copies, axis=1)
+
+
+def _ledoit_wolf_cov(X):
+    """
+    Estimate covariance with Ledoit-Wolf optimal shrinkage.
+
+    Parameters
+    ----------
+    X : array of shape (n_times, n_features)
+        Data matrix (observations × features).
+
+    Returns
+    -------
+    cov : array of shape (n_features, n_features)
+        Regularised covariance estimate.
+    shrinkage : float
+        Optimal shrinkage coefficient selected by Ledoit-Wolf.
+    """
+    from sklearn.covariance import LedoitWolf
+
+    lw = LedoitWolf().fit(X)
+    return lw.covariance_, lw.shrinkage_
+
+
+def rtcca(X, aux, tau=1, n_emb=3, ct=0.3, pca_aux=False, pca_fnirs=False, shrink=True):
+    r"""
+    Extract GLM regressors using regularised temporally embedded CCA.
+
+    Derives nuisance regressors from auxiliary signals (e.g. accelerometry)
+    and fNIRS data using temporally embedded Canonical Correlation Analysis
+    (tCCA) with optional Ledoit-Wolf covariance regularisation, as described
+    in :footcite:`vonLuhmannEtAl2020`.
+
+    Parameters
+    ----------
+    X : array of shape (n_times, n_fnirs_channels)
+        fNIRS signal matrix.
+    aux : array of shape (n_times, n_aux_channels)
+        Auxiliary signal matrix (e.g. accelerometer). Feeding in
+        PCA-orthogonalised data is advised.
+    tau : int
+        Lag in samples between consecutive temporal embeddings.
+    n_emb : int
+        Number of additional time-shifted copies to include in the
+        temporally embedded auxiliary matrix.
+    ct : float
+        Canonical correlation threshold. Only components whose canonical
+        correlation exceeds ``ct`` are returned as regressors.
+    pca_aux : bool
+        If ``True``, reduce ``aux`` to its principal components before
+        temporal embedding.
+    pca_fnirs : bool
+        If ``True``, reduce ``X`` to its principal components before CCA.
+    shrink : bool
+        If ``True``, regularise auto-covariance matrices using Ledoit-Wolf
+        optimal shrinkage :footcite:`LedoitWolf2004`.
+
+    Returns
+    -------
+    regressors : array of shape (n_times, n_components)
+        Noise regressors for use in a GLM design matrix. Contains only the
+        CCA components whose canonical correlation exceeds ``ct``.
+    info : dict
+        Diagnostic information:
+
+        ``'correlations'`` : array of shape (n_all_components,)
+            Canonical correlations for all extracted components, sorted
+            in descending order.
+        ``'fnirs_sources'`` : array of shape (n_times, n_all_components)
+            fNIRS data projected onto CCA filters.
+        ``'aux_sources'`` : array of shape (n_times, n_all_components)
+            Temporally embedded auxiliary data projected onto CCA filters.
+        ``'fnirs_filters'`` : array
+            CCA spatial filters for fNIRS.
+        ``'aux_filters'`` : array
+            CCA spatial filters for the temporally embedded auxiliary matrix.
+        ``'aux_filters_reduced'`` : array
+            Auxiliary filters retained after correlation thresholding.
+        ``'aux_embedded'`` : array of shape (n_times, n_aux_channels * (n_emb + 1))
+            Temporally embedded auxiliary matrix used in CCA.
+        ``'shrinkage_fnirs'`` : float | None
+            Ledoit-Wolf shrinkage coefficient for fNIRS (``None`` when
+            ``shrink=False``).
+        ``'shrinkage_aux'`` : float | None
+            Ledoit-Wolf shrinkage coefficient for auxiliary signals (``None``
+            when ``shrink=False``).
+
+    Notes
+    -----
+    The algorithm follows :footcite:`vonLuhmannEtAl2020`:
+
+    1. Optionally project ``aux`` and ``X`` onto their principal components.
+    2. Construct a temporally embedded auxiliary matrix :math:`Y` by
+       appending ``n_emb`` copies of ``aux``, each shifted by an integer
+       multiple of ``tau`` samples.
+    3. Z-score both :math:`X` and :math:`Y` (zero mean, unit variance per
+       channel).
+    4. Estimate auto-covariance matrices :math:`C_{XX}` and :math:`C_{YY}`
+       with optional Ledoit-Wolf shrinkage, and the empirical cross-covariance
+       :math:`C_{XY}`.
+    5. Solve the symmetric generalised eigenvalue problem
+
+       .. math::
+
+           \begin{bmatrix} 0 & C_{XY} \\
+                           C_{YX} & 0 \end{bmatrix} v = \lambda
+           \begin{bmatrix} C_{XX} & 0 \\
+                           0 & C_{YY} \end{bmatrix} v
+
+       for canonical filters :math:`v` and canonical correlations
+       :math:`\\lambda`.
+    6. Project the temporally embedded auxiliary matrix through its CCA
+       filter and retain components where
+       :math:`\lambda > \rho_{\text{thresh}}` as noise regressors.
+
+    References
+    ----------
+    .. footbibliography::
+    """
+    if pca_aux:
+        aux = PCA().fit_transform(aux)
+    if pca_fnirs:
+        X = PCA().fit_transform(X)
+
+    Y = _temporal_embedding(aux, tau, n_emb)
+
+    n_times = min(X.shape[0], Y.shape[0])
+    X = X[:n_times]
+    Y = Y[:n_times]
+
+    X = _zscore(X, axis=0)
+    Y = _zscore(Y, axis=0)
+
+    shrinkage_fnirs = None
+    shrinkage_aux = None
+    if shrink:
+        Cxx, shrinkage_fnirs = _ledoit_wolf_cov(X)
+        Cyy, shrinkage_aux = _ledoit_wolf_cov(Y)
+    else:
+        Cxx = X.T @ X / (n_times - 1)
+        Cyy = Y.T @ Y / (n_times - 1)
+
+    Cxy = X.T @ Y / (n_times - 1)
+    Cyx = Cxy.T
+
+    dx, dy = Cxy.shape
+    A = np.block([[np.zeros((dx, dx)), Cxy], [Cyx, np.zeros((dy, dy))]])
+    B = np.block([[Cxx, np.zeros((dx, dy))], [np.zeros((dy, dx)), Cyy]])
+
+    eigvals, eigvecs = eigh(A, B)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    W_x = eigvecs[:dx]
+    W_y = eigvecs[dx:]
+    U = X @ W_x
+    V = Y @ W_y
+
+    mask = eigvals > ct
+    regressors = V[:, mask]
+
+    info = dict(
+        correlations=eigvals,
+        fnirs_sources=U,
+        aux_sources=V,
+        fnirs_filters=W_x,
+        aux_filters=W_y,
+        aux_filters_reduced=W_y[:, mask],
+        aux_embedded=Y,
+        shrinkage_fnirs=shrinkage_fnirs,
+        shrinkage_aux=shrinkage_aux,
+    )
+
+    return regressors, info

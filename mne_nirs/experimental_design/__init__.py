@@ -7,4 +7,5 @@ from ._experimental_design import (
     make_first_level_design_matrix,
     longest_inter_annotation_interval,
     drift_high_pass,
+    rtcca
 )
